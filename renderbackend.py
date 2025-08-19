@@ -68,7 +68,7 @@ app = FastAPI(title="BIAL Regulatory Platform API")
 # --- CORS Middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8000/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -322,5 +322,6 @@ async def download_report(request: DownloadRequest):
 @app.get("/")
 def read_root():
     return {"message": "BIAL Regulatory Platform API is running."}
+
 
 # To run this app: uvicorn main:app --reload
