@@ -23,4 +23,6 @@ pymongo
 uvicorn
 fastapi
 python-multipart
+python-docx
 PyPDF2
+beautifulsoup4
