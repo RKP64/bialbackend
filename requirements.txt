@@ -26,3 +26,5 @@ python-multipart
 python-docx
 PyPDF2
 beautifulsoup4
+python-jose[cryptography]
+passlib[bcrypt]
