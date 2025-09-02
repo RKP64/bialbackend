@@ -16,6 +16,7 @@ import html
 import traceback
 import re
 import docx
+from docx.shared import Inches
 import requests
 from docx import Document
 import io
@@ -42,6 +43,8 @@ import time
 # --- SECURITY IMPORTS ---
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+import jwt as pyjwt # Using pyjwt for external token validation
+from jwt.algorithms import RSAAlgorithm
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -49,8 +52,14 @@ load_dotenv()
 # --- SECURITY CONFIGURATION ---
 SECRET_KEY = os.environ.get("SECRET_KEY", "a_very_secret_key_that_should_be_in_env_for_production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 DEV_MODE = os.environ.get("DEV_MODE", "false").lower() == "true"
+
+# --- Entra ID / SSO Configuration ---
+TENANT_ID = os.environ.get("TENANT_ID")
+CLIENT_ID = os.environ.get("CLIENT_ID")
+ISSUER_URL = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
+JWKS_URL = f"https://login.microsoftonline.com/{TENANT_ID}/discovery/v2.0/keys"
 
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -80,6 +89,7 @@ class AzureCredentials(BaseModel):
     cosmos_database_name: str = os.environ.get("COSMOS_DATABASE_NAME")
     cosmos_logs_collection: str = os.environ.get("COSMOS_LOGS_COLLECTION")
     cosmos_users_collection: str = os.environ.get("COSMOS_USERS_COLLECTION", "Users")
+    cosmos_feedback_collection: str = os.environ.get("COSMOS_FEEDBACK_COLLECTION", "Feedback")
     app_insights_connection_string: str = os.environ.get("APP_INSIGHTS_CONNECTION_STRING")
     content_safety_endpoint: str = os.environ.get("CONTENT_SAFETY_ENDPOINT")
     content_safety_key: str = os.environ.get("CONTENT_SAFETY_KEY")
@@ -125,6 +135,13 @@ class ServiceClients:
             self.tracer = Tracer(exporter=AzureExporter(connection_string=config.app_insights_connection_string), sampler=ProbabilitySampler(1.0))
         else:
             self.tracer = None
+            
+        # Fetch and cache Microsoft's signing keys for SSO
+        try:
+            self.jwks_client = pyjwt.PyJWKClient(JWKS_URL)
+        except Exception as e:
+            print(f"Could not fetch JWKS from Microsoft: {e}")
+            self.jwks_client = None
 
 clients = ServiceClients()
 
@@ -133,22 +150,15 @@ class ChatMessage(BaseModel):
     role: str
     content: str
 
-# New Response model for chat to include the source
-class MDAChatResponse(BaseModel):
-    role: str
-    content: str
-    source: str # Will be 'web' or 'internal'
+class ConversationalChatResponse(BaseModel):
+    answer: str
+    plan: List[str]
+    sources: List[Dict[str, Any]]
+    source: str
 
 class ChatRequest(BaseModel):
     question: str
     history: List[ChatMessage] = []
-    temperature: float = 0.5
-    max_tokens: int = 16000
-    use_content_safety: bool = False
-    log_backend: str = "Custom (Azure Cosmos DB)"
-
-class MDAChatRequest(ChatRequest):
-    web_search_engine: str = "SerpApi" # Defaulting to SerpApi as requested
 
 class AnalysisResponse(BaseModel):
     report: str
@@ -163,7 +173,9 @@ class RefineReportResponse(BaseModel):
 class DownloadRequest(BaseModel):
     html_content: str
 
-# --- AUTHENTICATION MODELS ---
+class SSOLoginRequest(BaseModel):
+    sso_token: str
+
 class User(BaseModel):
     username: str
 
@@ -181,7 +193,13 @@ class UserCreate(BaseModel):
     username: str
     password: str
 
-# --- Shared System Prompt (Complete Version) ---
+class FeedbackRequest(BaseModel):
+    question: str
+    answer: str
+    feedback: str # "like" or "dislike"
+    user: str
+
+# --- Shared System Prompt ---
 SHARED_SYSTEM_PROMPT = """You are an AI assistant for Multiyear tariff submission for AERA. Your final response should have 1500 words at least.
 * **Source Attribution (Authority Data - Handling Terminology for Authority's Stance):**
     If the query relates to the "Authority's" stance (e.g., user asks “What is the authority’s *approved* change?”, “What did the authority *decide*?”, “What was *proposed* by the authority?”), your primary goal is to find the authority's documented action or position on that specific subject.
@@ -235,9 +253,8 @@ async def get_current_user_prod(token: str = Depends(oauth2_scheme)):
         token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    user = get_user_from_db(username=token_data.username)
-    if user is None: raise credentials_exception
-    return user
+    return User(username=token_data.username)
+
 
 async def get_current_user_dev():
     """A dummy dependency that bypasses auth for local development."""
@@ -245,41 +262,7 @@ async def get_current_user_dev():
 
 auth_dependency = get_current_user_dev if DEV_MODE else get_current_user_prod
 
-
-# --- Observability & Security ---
-def log_interaction(user, question, answer, duration, log_backend):
-    if log_backend == "Custom (Azure Cosmos DB)" and clients.mongo_client:
-        try:
-            log_collection = clients.mongo_client[config.cosmos_database_name][config.cosmos_logs_collection]
-            log_collection.insert_one({
-                "timestamp": datetime.now(timezone.utc), 
-                "user": user, 
-                "question": question, 
-                "answer": answer, 
-                "duration": duration
-            })
-        except Exception as e:
-            print(f"Failed to write to custom audit log: {e}")
-    if log_backend == "Azure Monitor" and clients.tracer:
-        with clients.tracer.span(name="UserInteraction") as span:
-            span.add_attribute("user", user)
-            span.add_attribute("question", question)
-            span.add_attribute("answer_preview", answer[:100])
-            span.add_attribute("duration_seconds", duration)
-
-def analyze_text_for_safety(text_to_analyze: str, use_content_safety: bool):
-    if not use_content_safety or not clients.content_safety_client:
-        return True, "Content Safety disabled."
-    try:
-        analysis_request = AnalyzeTextOptions(text=text_to_analyze, categories=[TextCategory.HATE, TextCategory.SELF_HARM, TextCategory.SEXUAL, TextCategory.VIOLENCE])
-        response = clients.content_safety_client.analyze_text(analysis_request)
-        for category in response.categories_analysis:
-            if category.severity > 1: return False, f"Harmful content detected in category '{category.category}' with severity {category.severity}."
-        return True, "Content is safe."
-    except Exception as e:
-        return False, f"Content safety check failed: {e}"
-
-# --- Core Logic ---
+# --- Core Logic Functions ---
 def extract_text_from_docx(file: UploadFile) -> str:
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
@@ -292,49 +275,40 @@ def extract_text_from_docx(file: UploadFile) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading Word document: {e}")
 
-def get_query_vector(text_to_embed: str):
-    if not clients.search_query_embeddings_model:
-        return None
-    try:
-        return clients.search_query_embeddings_model.embed_query(text_to_embed)
-    except Exception as e:
-        print(f"Error generating query vector: {e}")
-        return None
-
 def query_azure_search(query_text: str, index_name: str, k: int = 5):
     if check_creds(config.search_endpoint) or check_creds(config.search_api_key):
         return "Error: Azure Search service is not configured.", []
     try:
         search_client = SearchClient(config.search_endpoint, index_name, AzureKeyCredential(config.search_api_key))
-        select_fields = ["content", "filepath", "url", "title"]
         
         search_kwargs = {
             "search_text": query_text if query_text and query_text.strip() else "*",
             "top": k,
-            "select": ",".join(select_fields),
             "query_type": "semantic",
             "semantic_configuration_name": config.default_semantic_config_name,
             "query_caption": "extractive",
             "query_answer": "extractive"
         }
         
-        if (query_vector := get_query_vector(query_text)):
-            search_kwargs["vector_queries"] = [VectorizedQuery(vector=query_vector, k_nearest_neighbors=k, fields=config.default_vector_field_name)]
-        
         results = search_client.search(**search_kwargs)
         
-        processed_references = {}
-        context = ""
-        for doc in results:
-            context += doc.get("content", "") + "\n\n"
-            display_name = doc.get("title") or (os.path.basename(doc.get("filepath", "")) if doc.get("filepath") else "Source")
-            ref_key = doc.get("url") or display_name
-            if ref_key not in processed_references:
-                processed_references[ref_key] = {"filename_or_title": display_name, "url": doc.get("url"), "score": doc.get("@search.score"), "reranker_score": doc.get("@search.reranker_score")}
-        references_data = list(processed_references.values())
+        context = "\n\n".join([doc.get("content", "") for doc in results])
+        references_data = [{"filename_or_title": doc.get("title") or os.path.basename(doc.get("filepath", "")), "url": doc.get("url")} for doc in results]
         return context.strip(), references_data
     except Exception as e:
         return f"Error accessing search index: {e}", []
+
+def query_serpapi(query: str, count: int = 5) -> str:
+    if check_creds(config.serpapi_api_key): return "Error: SerpApi API key not configured."
+    params = {"q": query, "api_key": config.serpapi_api_key, "num": count}
+    try:
+        response = requests.get("https://serpapi.com/search.json", params=params, timeout=15)
+        response.raise_for_status()
+        search_results = response.json()
+        organic_results = search_results.get("organic_results", [])
+        snippets = [f"Title: {res.get('title', 'N/A')}\nSnippet: {res.get('snippet', 'N/A')}" for res in organic_results]
+        return "\n".join(snippets) if snippets else "No web search results found via SerpApi."
+    except Exception as e: return f"Error during SerpApi search: {e}"
 
 def query_bing_web_search(query: str, count: int = 5) -> str:
     if check_creds(config.bing_search_api_key): return "Error: Bing Search API key not configured."
@@ -348,28 +322,7 @@ def query_bing_web_search(query: str, count: int = 5) -> str:
         return "\n".join(snippets) if snippets else "No web search results found."
     except Exception as e: return f"Error during Bing web search: {e}"
 
-def query_serpapi(query: str, count: int = 5) -> str:
-    if check_creds(config.serpapi_api_key): 
-        print("SerpApi API key not configured.")
-        return "Error: SerpApi API key not configured."
-    params = {"q": query, "api_key": config.serpapi_api_key, "num": count}
-    try:
-        print(f"Querying SerpApi for: {query}")
-        response = requests.get("https://serpapi.com/search.json", params=params, timeout=15)
-        response.raise_for_status()
-        search_results = response.json()
-        organic_results = search_results.get("organic_results", [])
-        snippets = [f"Title: {res.get('title', 'N/A')}\nSnippet: {res.get('snippet', 'N/A')}" for res in organic_results]
-        if not snippets:
-            print("No web search results found via SerpApi.")
-            return "No web search results found via SerpApi."
-        return "\n".join(snippets)
-    except requests.exceptions.RequestException as e: 
-        print(f"Error during SerpApi search: {e}")
-        return f"Error during SerpApi search: {e}"
-
 def get_query_plan_from_llm(user_question: str, history: List[ChatMessage]):
-    if not clients.planning_openai_client: return "Error: Planning LLM not configured.", None
     history_str = "\n".join([f'{msg.role}: {msg.content}' for msg in history])
     planning_prompt = f"""You are a query planning assistant specializing in breaking down complex questions about **AERA regulatory documents, often concerning tariff orders, consultation papers, control periods, and specific financial data (like CAPEX, Opex, Traffic) for airport operators such as DIAL, MIAL, BIAL, HIAL.**
 Your primary task is to take a user's complex question related to these topics and break it down into a series of 1 to 20 simple, self-contained search queries that can be individually executed against a document index. Each search query should aim to find a specific piece of information (e.g., a specific figure, a justification, a comparison point) needed to answer the overall complex question.
@@ -383,120 +336,87 @@ CONVERSATION HISTORY:
 User's complex question: {user_question}
 Your JSON list of search queries:"""
     try:
-        response = clients.planning_openai_client.chat.completions.create(model=config.planning_llm_deployment_id, messages=[{"role": "user", "content": planning_prompt}], temperature=0.0, max_tokens=16000)
+        response = clients.planning_openai_client.chat.completions.create(model=config.planning_llm_deployment_id, messages=[{"role": "user", "content": planning_prompt}], temperature=0.0, max_tokens=1000)
         plan_str = response.choices[0].message.content
         if match := re.search(r'\[.*\]', plan_str, re.DOTALL):
-            return None, json.loads(match.group(0))
-        return None, [user_question]
+            return json.loads(match.group(0))
+        return [user_question]
     except Exception as e:
-        return f"Error in query planner: {e}", [user_question]
+        print(f"Error in query planner: {e}")
+        return [user_question]
 
-def generate_answer_from_search(user_question: str, history: List[ChatMessage], system_prompt_override=None):
+async def handle_chat_request(request: ChatRequest):
+    """
+    Handles all chat requests using the ADVANCED RAG pipeline with a query planner
+    and includes web search logic with fallback.
+    """
     if not clients.synthesis_openai_client:
         raise HTTPException(status_code=503, detail="Synthesis LLM not configured.")
     
-    plan_error, query_plan = get_query_plan_from_llm(user_question, history)
-    if plan_error:
-        print(plan_error)
-
+    web_search_keywords = ["web search", "latest", "current", "internet"]
+    is_web_search = any(w in request.question.lower() for w in web_search_keywords)
+    
+    source = "internal"
+    query_plan = []
+    unique_sources = []
     combined_context = ""
-    all_retrieved_details = []
-    for sub_query in query_plan:
-        context_for_step, retrieved_details_for_step = query_azure_search(sub_query, config.default_search_index_name)
-        if context_for_step and not context_for_step.startswith("Error"):
-            combined_context += f"\n\n--- Context for sub-query: '{sub_query}' ---\n" + context_for_step
-            all_retrieved_details.extend(retrieved_details_for_step)
-    
-    if not combined_context.strip():
-        return "No relevant information found in search index.", []
 
-    system_prompt = system_prompt_override or SHARED_SYSTEM_PROMPT
-    
-    messages = [{"role": "system", "content": system_prompt}, *[msg.dict() for msg in history], {"role": "user", "content": f"Based on the conversation and new context, answer: {user_question}\n\nCONTEXT:\n{combined_context}"}]
-    
-    try:
-        response = clients.synthesis_openai_client.chat.completions.create(
-            model=config.deployment_id, 
-            messages=messages, 
-            temperature=0.2, 
-            max_tokens=16000
-        )
-        return response.choices[0].message.content, all_retrieved_details
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating answer: {e}")
-
-# --- STREAMING LOGIC ---
-async def stream_generator(user_question: str, history: List[ChatMessage], current_user: User, log_backend: str):
-    if not clients.synthesis_openai_client:
-        raise HTTPException(status_code=503, detail="OpenAI service is not configured.")
-    
-    start_time = time.time()
-    full_content = ""
-    
-    try:
-        plan_error, query_plan = get_query_plan_from_llm(user_question, history)
-        if plan_error: print(plan_error) # Log the error
-        yield f'{json.dumps({"type": "plan", "steps": query_plan})}\n'
-
+    if is_web_search:
+        source = "web"
+        print(f"--- Web search triggered for: '{request.question}' ---")
+        
         combined_context = ""
+        if not check_creds(config.serpapi_api_key):
+            print("Attempting web search with SerpApi...")
+            combined_context = query_serpapi(request.question)
+
+        if not combined_context or combined_context.startswith("Error"):
+            if not check_creds(config.bing_search_api_key):
+                print("SerpApi failed or not configured, attempting web search with Bing Search...")
+                combined_context = query_bing_web_search(request.question)
+            else:
+                 if not combined_context:
+                    combined_context = "Error: No web search API key configured."
+        
+        query_plan = [request.question]
+    else:
+        source = "internal"
+        print(f"--- Internal RAG triggered for: '{request.question}' ---")
+        query_plan = get_query_plan_from_llm(request.question, request.history)
         all_retrieved_details = []
         for sub_query in query_plan:
             context_for_step, retrieved_details_for_step = query_azure_search(sub_query, config.default_search_index_name)
             if context_for_step and not context_for_step.startswith("Error"):
                 combined_context += f"\n\n--- Context for sub-query: '{sub_query}' ---\n" + context_for_step
                 all_retrieved_details.extend(retrieved_details_for_step)
-        
-        unique_sources = []
-        if all_retrieved_details:
-            unique_sources = list({(item.get('url') or item.get('filename_or_title')): item for item in all_retrieved_details}.values())
-            yield f'{json.dumps({"type": "sources", "data": unique_sources})}\n'
+        unique_sources = list({(item.get('url') or item.get('filename_or_title')): item for item in all_retrieved_details}.values())
 
-        if not combined_context.strip():
-            full_content = "No relevant information found."
-            yield f'{json.dumps({"type": "answer_chunk", "content": full_content})}\n'
-            return
+    if not combined_context.strip():
+        return ConversationalChatResponse(answer="I could not find any relevant information to answer your question.", plan=query_plan, sources=unique_sources, source=source)
 
-        formatted_refs_str = "\n".join([f"- {source.get('filename_or_title', 'Unknown Source')}" for source in unique_sources])
-        synthesis_user_content = (
-            f"Based on the general background provided in the system prompt, please synthesize a comprehensive answer to the original USER QUESTION using all the following retrieved CONTEXT from multiple search steps and the IDENTIFIED CONTEXT SOURCES.\n\n"
-            f"ORIGINAL USER QUESTION: {user_question}\n\n"
-            f"AGGREGATED CONTEXT (from multiple search steps):\n---------------------\n{combined_context}\n---------------------\n\n"
-            f"IDENTIFIED CONTEXT SOURCES (from metadata):\n---------------------\n{formatted_refs_str}\n---------------------\n\n"
-            f"SPECIFIC INSTRUCTIONS FOR YOUR RESPONSE (in addition to the general background provided):\n"
-            f"1. Directly address all parts of the ORIGINAL USER QUESTION.\n"
-            f"2. Synthesize information from the different context sections if they relate to different aspects of the original question.\n"
-            f"3. Format numerical data extracted from tables into a clean HTML table with borders (e.g., <table border='1'>...). Use table headers (<th>) and table data cells (<td>). DO NOT repeat content.\n"
-            f"4. **References are crucial.** At the end of your answer, include a 'References:' section listing the source documents.\n\n"
-            f"COMPREHENSIVE, CLEAN HTML ANSWER TO THE ORIGINAL USER QUESTION:\n"
-        )
-        
-        messages = [
-            {"role": "system", "content": SHARED_SYSTEM_PROMPT},
-            *[msg.dict() for msg in history],
-            {"role": "user", "content": synthesis_user_content}
-        ]
-        
-        response = clients.synthesis_openai_client.chat.completions.create(
-            model=config.deployment_id, messages=messages, temperature=0.2, max_tokens=16000, stream=False
-        )
-        full_content = response.choices[0].message.content or ""
-        if full_content:
-            yield f'{json.dumps({"type": "answer_chunk", "content": full_content})}\n'
+    messages = [
+        {"role": "system", "content": SHARED_SYSTEM_PROMPT},
+        *[msg.dict() for msg in request.history],
+        {"role": "user", "content": f"Based on the following context from a {source} search, answer the user's question.\n\nUser Question: {request.question}\n\nCONTEXT:\n{combined_context}"}
+    ]
     
+    try:
+        response = clients.synthesis_openai_client.chat.completions.create(
+            model=config.deployment_id, 
+            messages=messages, 
+            temperature=0.2, 
+            max_tokens=4000
+        )
+        final_answer = response.choices[0].message.content
+        return ConversationalChatResponse(answer=final_answer, plan=query_plan, sources=unique_sources, source=source)
     except Exception as e:
-        full_content = "An error occurred during generation."
-        print(f"Error during streaming: {e}")
-        yield f'{json.dumps({"type": "error", "content": full_content})}\n'
-    finally:
-        duration = time.time() - start_time
-        log_interaction(current_user.username, user_question, full_content, duration, log_backend)
+        raise HTTPException(status_code=500, detail=f"Error generating answer: {e}")
 
 # --- API Endpoints ---
 @app.get("/")
 def read_root():
     return {"message": "BIAL Regulatory Platform API is running."}
 
-# --- AUTHENTICATION ENDPOINTS ---
 @app.post("/register", response_model=User)
 async def register_user(user: UserCreate):
     if not clients.mongo_client:
@@ -524,19 +444,41 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     access_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- PROTECTED ENDPOINTS ---
-@app.post("/chat-stream")
-async def conversational_chat_stream(request: ChatRequest, current_user: User = Depends(auth_dependency)):
-    return StreamingResponse(stream_generator(request.question, request.history, current_user, request.log_backend), media_type="text/event-stream")
+@app.post("/login/sso", response_model=Token)
+async def login_sso(request: SSOLoginRequest):
+    if not all([TENANT_ID, CLIENT_ID]):
+        raise HTTPException(status_code=503, detail="SSO environment variables not configured on server.")
+    if not clients.jwks_client:
+        raise HTTPException(status_code=503, detail="SSO service is not configured correctly (JWKS keys not found).")
+    try:
+        signing_key = clients.jwks_client.get_signing_key_from_jwt(request.sso_token).key
+        
+        decoded_token = pyjwt.decode(
+            request.sso_token,
+            signing_key,
+            algorithms=["RS256"],
+            audience=CLIENT_ID,
+            issuer=ISSUER_URL
+        )
+        
+        username = decoded_token.get("preferred_username") or decoded_token.get("upn")
+        if not username:
+            raise HTTPException(status_code=400, detail="Username not found in SSO token.")
 
-@app.get("/get-chat-history")
-async def get_chat_history(current_user: User = Depends(auth_dependency)):
-    if not clients.mongo_client:
-        raise HTTPException(status_code=503, detail="Database service is not configured.")
-    log_collection = clients.mongo_client[config.cosmos_database_name][config.cosmos_logs_collection]
-    history_cursor = log_collection.find({"user": current_user.username}).sort("timestamp", -1).limit(20)
-    history = [{"question": doc.get("question"), "answer": doc.get("answer"), "timestamp": doc.get("timestamp").isoformat()} for doc in history_cursor]
-    return history
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        internal_access_token = create_access_token(
+            data={"sub": username}, expires_delta=access_token_expires
+        )
+        return {"access_token": internal_access_token, "token_type": "bearer"}
+
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="SSO token has expired.")
+    except pyjwt.InvalidAudienceError:
+        raise HTTPException(status_code=401, detail="Invalid SSO token audience.")
+    except pyjwt.InvalidIssuerError:
+        raise HTTPException(status_code=401, detail="Invalid SSO token issuer.")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Could not validate SSO token: {e}")
 
 @app.post("/analyze-document", response_model=AnalysisResponse)
 async def analyze_document(analysis_title: str = Form(...), file: UploadFile = File(...), current_user: User = Depends(auth_dependency)):
@@ -545,14 +487,13 @@ async def analyze_document(analysis_title: str = Form(...), file: UploadFile = F
     
     start_time = time.time()
     final_report = ""
-    full_prompt = ""
     try:
         extracted_text = extract_text_from_docx(file)
-        summary_prompt = f"Please provide a detail, neutral summary of the key points of the following document text:\n\n---\n{extracted_text[:20000]}\n---"
+        summary_prompt = f"Please provide a detailed, neutral summary of the key points of the following document text:\n\n---\n{extracted_text[:20000]}\n---"
         document_summary = clients.synthesis_openai_client.chat.completions.create(model=config.deployment_id, messages=[{"role": "user", "content": summary_prompt}]).choices[0].message.content
 
         analysis_prompts_config = {
-            "MDA Manpower Analysis": {
+             "MDA Manpower Analysis": {
            "Analysis of manpower expenditure projection for BIAL for fourth control period": f"The uploaded document proposes the following: '{{document_summary}}'. Use the following steps for analysing the manpower expenditure projected by BIAL: 1- Year on Year growth of personnel cost projected by BIAL for fourth control period. 2- Justification for personnel cost growth in fourth control period provided by BIAL. 3- year on year Manpower Expenses growth Submitted by DIAL for fourth control period in DIAL fourth control period consultation Paper. 4- Justification provided by DIAL for manpower expenses submitted by DIAL for fourth control period. 5- Examination and rationale provided by authority for manpower expenses submitted by DIAL for fourth control period. 6- Year on Year growth of employee cost submitted by MIAL for fourth control period for fourth control period in MIAL Fourth control consultation Paper. 7- Justification provided by MIAL for manpower expenses per passeneger traffic submitted by MIAL for fourth control period. 8- Examination and rationale provided by authority for manpower expenses submitted by MIAL for fourth control period. 9- Using the rationale extracted in steps 4, 5 7 and 8 suggest how the rationale or justification provided by BIAL in the MDA document for manpower expenditure for fourth control period can be enhanced. For every suggestion made, give specific reason why the suggestion was made by you using relevant references from DIAL and MIAL tariff orders or consultation papers.",
            "Analysis of actual manpower expenditure for BIAL for third control period": f"The uploaded document proposes the following: '{{document_summary}}'. Use the following steps for analyzing the actual manpower expenditure for the third control period: 1. Actual manpower expenditure for BIAL and variance from authority approved manpower expenditure for the third control period. 2. Justification for manpower expenditure in third control period provided by BIAL. 3 Actual manpower expenditure for DIAL and variance from authority approved manpower expenditure for the third control period. 4. Justification provided by DIAL for actual manpower expenses for third control period and the reason for variance compared to authority approved figures. 5. Examination and rationale provided by authority for actual manpower expenditure for only DIAL for third control period and its variance compared to authority approved figures. 6. Actual manpower expenditure for MIAL and variance from authority approved manpower expenditure for the third control period. 7. Justification provided by MIAL for actual manpower expenses submitted by MIAL for third control period and the reason for variance with authority approved figures. 8. Examination and rationale provided by authority for actual manpower expenditure submitted by only MIAL for third control period and its variance compared to authority approved figures. 9. Using the rationale extracted in steps 4, 5, 7, and 8, suggest how the rationale or justification provided by BIAL in the MDA document for manpower expenditure for the third control period can be enhanced. For every suggestion made, give specific reason why the suggestion was made by you using relevant references from DIAL and MIAL tariff orders or consultation papers.",
            "Analysis of KPI Computation for BIAL for fourth Control period": f"the upload document proposes the following: '{{document_summary}}'. Use the following steps for analyzing the KPI Computation.Calculate and compare the YoY change of employee expenses of DIAL and MIAL for the fourth control period,first give what is total manpower expense submitted by DIAL for fourth control period , employee cost submitted by MIAL for fourth control period . after wards calculate the passanger traffic submitted by DIAL and MIAL for fourth control period . divide the passenger traffic per manpoer cost anf compare it anf give us the rationale . Step 1: KPI Comparison. To begin, you will collect specific data from the DIAL Fourth Control Period Consultation Paper and DIAL Fourth Control Period Tariff Order, as well as the MIAL Fourth Control Period Consultation Paper and MIAL Fourth Control Period Tariff Order. From these documents, meticulously extract the manpower count, total passenger traffic, and total manpower expenditure for each fiscal year of their respective fourth control periods. With this comprehensive dataset, proceed to calculate two critical KPIs for both airports: manpower count per total passenger traffic and manpower expenditure per total passenger traffic. Once these KPIs are computed, compare them to BIAL's corresponding figures, assessing whether BIAL’s KPIs are higher, lower, or in line, while being careful to only compare data for years where the passenger traffic is similar to ensure the KPI comparison is accurate and meaningful. First, carefully examine BIAL's provided MDA document to identify the specific justifications for its manpower expense projections, including any explanations for variances from the prior control period. Next, to enhance this rationale, you will consult the detailed analyses and findings in the DIAL and MIAL Fourth Control Period Consultation Papers and Tariff Orders. Specifically, you will look for how these regulatory documents justify their own employee expense projections, such as by detailing factors like inflation, annual growth rates, and specific manpower growth factors tied to strategic operational expansions. Using these as a benchmark, you will then suggest improvements for BIAL's own justifications, for example, by recommending that BIAL provide a more granular breakdown of cost drivers, link employee growth to new projects or terminal expansions, or justify its average cost per employee based on specific salary benchmarks or industry-wide trends, ultimately making BIAL's rationale as transparent and well-supported as that of its peers."
@@ -568,87 +509,42 @@ async def analyze_document(analysis_title: str = Form(...), file: UploadFile = F
                 "Analysis of repairs and maintenance expenditure for true up for BIAL for third control period": f"The uploaded document proposes the following: '{{document_summary}}'. Use the following steps for analysing the repairs and maintenance expenditure projected by BIAL: 1- Year on Year actual growth of repairs and maintenance expenditure by BIAL for third control period in the MDA document 2- Year wise repairs and maintenance expenditure as a percentage of regulated asset base for BIAL for third control period in the MDA document. 3- Justification provided by BIAL for the repairs and maintenance expense for third control period and the variance of repairs and maintenance expense with authority approved figures in third control period in the MDA document. 4- Year on Year growth of actual repairs and maintenance expenditure submitted by DIAL for true up of third control period in the fourth control period consultation paper or tariff order. 5- Year wise repairs and maintenance expenditure as a percentage of regulated asset base for DIAL for third control period in the fourth control period consultation paper or tariff order. 6- Justification for actual repairs and maintenance expense in third control period provided by DIAL and the variance with authority approved figures for the third control period in fourth control period consultation paper or tariff order. 7- Examination and rationale provided by authority on actual repairs and maintenance cost submitted by DIAL for third control period in the fourth control period consultation paper or tariff order. 8- Year on Year growth of actual repairs and maintenance expenditure submitted by MIAL for true up of third control period in the fourth control period consultation paper or tariff order. 9- Justification for actual repairs and maintenance expense in third control period provided by MIAL and the variance with authority approved figures for the third control period in fourth control period consultation paper or tariff order. 10- Year wise repairs and maintenance expenditure as a percentage of regulated asset base for MIAL for third control period in the fourth control period consultation paper or tariff order. 11- Examination and rationale provided by authority on actual repairs and maintenance cost submitted by MIAL for third control period in the fourth control period consultation paper or tariff order. 12- Using the rationale extracted in steps 5, 6, 8, and 9 suggest how the rationale or justification provided by BIAL in the MDA document for repairs and maintenance expenditure for third control period can be enhanced. For every suggestion made, give specific reason why the suggestion is made using relevant references from DIAL and MIAL tariff orders or consultation papers",
                 "Analysis of repairs and maintenance expenditure projection for BIAL for fourth control period": f"The uploaded document proposes the following: '{{document_summary}}'. Use the following steps for analysing the repairs and maintenance expenditure projected by BIAL: 1- Year on Year growth of repairs and maintenance expenditure projections by BIAL for fourth control period in the MDA document 2- Year wise repairs and maintenance expenditure projection as a percentage of regulated asset base for BIAL for fourth control period in the MDA document. 3- Justification provided by BIAL for the repairs and maintenance expense for fourth control period in the MDA document. 4- Year on Year growth of repairs and maintenance expenditure projections submitted by DIAL for fourth control period in the fourth control period consultation paper or tariff order. 5- Year wise repairs and maintenance expenditure projections as a percentage of regulated asset base for DIAL for fourth control period in the fourth control period consultation paper or tariff order. 6- Justification for repairs and maintenance expense projections in fourth control period provided by DIAL in fourth control period consultation paper or tariff order. 7- Examination and rationale provided by authority on repairs and maintenance expenditure projections submitted by DIAL for fourth control period in the fourth control period consultation paper or tariff order. 8- Year on Year growth of repairs and maintenance expenditure projections submitted by MIAL for fourth control period in the fourth control period consultation paper or tariff order. 9- Year wise repairs and maintenance expenditure projections as a percentage of regulated asset base for MIAL for fourth control period in the fourth control period consultation paper or tariff order. 10- Justification for repairs and maintenance expense projections in fourth control period provided by MIAL in fourth control period consultation paper or tariff order. 11- Examination and rationale provided by authority on repairs and maintenance expenditure projections submitted by MIAL for fourth control period in the fourth control period consultation paper or tariff order 12- Using the rationale extracted in steps 5, 6, 8, and 9 suggest how the rationale or justification provided by BIAL in the MDA document for repairs and maintenance expenditure for fourth control period can be enhanced. For every suggestion made, give specific reason why the suggestion is made using relevant references from DIAL and MIAL tariff orders or consultation papers"
             },
-        
         }
         
-        prompt_template = None
-        for category in analysis_prompts_config.values():
-            if analysis_title in category:
-                prompt_template = category[analysis_title]
-                break
+        prompt_template = next((category[analysis_title] for category in analysis_prompts_config.values() if analysis_title in category), None)
         
         if not prompt_template:
             raise HTTPException(status_code=404, detail=f"Analysis title '{analysis_title}' not found.")
             
         full_prompt = prompt_template.format(document_summary=document_summary)
         
-        is_safe, safety_message = analyze_text_for_safety(full_prompt, use_content_safety=True)
-        if not is_safe:
-            raise HTTPException(status_code=400, detail=safety_message)
-
-        analysis_answer, _ = generate_answer_from_search(full_prompt, [], system_prompt_override=SHARED_SYSTEM_PROMPT)
+        context_for_report, retrieved_sources = query_azure_search(full_prompt, config.default_search_index_name, k=10)
         
+        sources_text = "\n".join([f"- {source.get('filename_or_title', 'Unknown Source')}" for source in retrieved_sources])
+
+        messages = [
+            {"role": "system", "content": SHARED_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Based on the following context and sources, please execute the plan outlined below. IMPORTANT: When you use information from the context, you MUST cite the relevant source filename from the 'SOURCES' list provided.\n\nCONTEXT:\n{context_for_report}\n\nSOURCES:\n{sources_text}\n\nPLAN:\n{full_prompt}"}
+        ]
+        
+        response = clients.synthesis_openai_client.chat.completions.create(model=config.deployment_id, messages=messages, temperature=0.2, max_tokens=4000)
+        analysis_answer = response.choices[0].message.content
+
         final_report = f"<h2>Analysis Report: {analysis_title}</h2><h3>Document Summary</h3><p>{document_summary}</p><hr /><h3>Analysis</h3>{analysis_answer}"
         return AnalysisResponse(report=final_report)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred during analysis: {e}")
-    finally:
-        duration = time.time() - start_time
-        log_interaction(current_user.username, f"MDA Analysis: {analysis_title}", final_report, duration, "Custom (Azure Cosmos DB)")
+        print("--- AN ERROR OCCURRED IN /analyze-document ---")
+        traceback.print_exc()
+        print("---------------------------------------------")
+        raise HTTPException(status_code=500, detail=f"An internal error occurred during analysis. Check server logs for details.")
 
-@app.post("/mda-chat", response_model=MDAChatResponse) # <-- UPDATED RESPONSE MODEL
-async def mda_chat(request: MDAChatRequest, current_user: User = Depends(auth_dependency)):
-    if not clients.synthesis_openai_client:
-        raise HTTPException(status_code=503, detail="OpenAI service is not configured.")
-    
-    start_time = time.time()
-    full_content = ""
-    source = "internal" # Default source
-    
-    try:
-        context_from_search = ""
-        # Determine if a web search is needed
-        if any(w in request.question.lower() for w in ["web search", "latest", "current", "internet"]):
-            source = "web"
-            print(f"--- Web search triggered for question: {request.question} ---")
-            if request.web_search_engine == "SerpApi":
-                context_from_search = query_serpapi(request.question)
-            else: # Fallback or other engines
-                context_from_search = query_bing_web_search(request.question)
-        else:
-            source = "internal"
-            print(f"--- Internal search triggered for question: {request.question} ---")
-            context_from_search, _ = query_azure_search(request.question, config.default_search_index_name)
-        
-        messages = [
-            {"role": "system", "content": SHARED_SYSTEM_PROMPT},
-            # History is not included here to keep the context clean for this specific Q&A
-            {"role": "user", "content": f"USER QUESTION: \"{request.question}\"\n\nSEARCH RESULTS from {source} search:\n---\n{context_from_search}\n---\n\nBased on the provided search results, please provide a detailed, formatted answer to the user's question."}
-        ]
+@app.post("/mda-chat", response_model=ConversationalChatResponse)
+async def mda_chat(request: ChatRequest, current_user: User = Depends(auth_dependency)):
+    return await handle_chat_request(request)
 
-        response = clients.synthesis_openai_client.chat.completions.create(
-            model=config.deployment_id, 
-            messages=messages,
-            temperature=0.2,
-            max_tokens=16000
-        )
-        full_content = response.choices[0].message.content
-        
-        # Return the new response model
-        return MDAChatResponse(role="assistant", content=full_content, source=source)
-        
-    except Exception as e:
-        print(f"An error occurred in mda-chat: {e}")
-        # Still return in the new format on error
-        return MDAChatResponse(
-            role="assistant", 
-            content=f"An error occurred: {e}", 
-            source="error"
-        )
-    finally:
-        duration = time.time() - start_time
-        log_interaction(current_user.username, request.question, full_content, duration, request.log_backend)
-
+@app.post("/conversational-chat", response_model=ConversationalChatResponse)
+async def conversational_chat(request: ChatRequest, current_user: User = Depends(auth_dependency)):
+    return await handle_chat_request(request)
 
 @app.post("/refine-report", response_model=RefineReportResponse)
 async def refine_report(request: RefineReportRequest, current_user: User = Depends(auth_dependency)):
@@ -666,37 +562,56 @@ async def refine_report(request: RefineReportRequest, current_user: User = Depen
         ---
         **FULL, REFINED, AND INTEGRATED REPORT:**"""
         
-        response = clients.synthesis_openai_client.chat.completions.create(model=config.deployment_id, messages=[{"role": "user", "content": refinement_prompt}], temperature=0.2, max_tokens=16000)
+        response = clients.synthesis_openai_client.chat.completions.create(model=config.deployment_id, messages=[{"role": "user", "content": refinement_prompt}], temperature=0.2, max_tokens=4000)
         return RefineReportResponse(refined_report=response.choices[0].message.content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred during report refinement: {e}")
+
+def parse_html_to_docx(soup, document):
+    for element in soup.children:
+        if isinstance(element, str):
+            if element.strip():
+                document.add_paragraph(element.strip())
+            continue
+
+        if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            level = int(element.name[1])
+            document.add_heading(element.get_text(strip=True), level=level)
+        elif element.name == 'p':
+            document.add_paragraph(element.get_text(strip=True))
+        elif element.name in ['ul', 'ol']:
+            for li in element.find_all('li', recursive=False):
+                document.add_paragraph(li.get_text(strip=True), style='List Bullet')
+        elif element.name == 'table':
+            rows_data = []
+            for row in element.find_all('tr'):
+                cols = [cell.get_text(strip=True) for cell in row.find_all(['td', 'th'])]
+                rows_data.append(cols)
+            
+            if not rows_data or not rows_data[0]: continue
+
+            table = document.add_table(rows=len(rows_data), cols=len(rows_data[0]))
+            table.style = 'Table Grid'
+            for i, row_data in enumerate(rows_data):
+                for j, cell_data in enumerate(row_data):
+                    if j < len(table.rows[i].cells):
+                        table.cell(i, j).text = cell_data
+            document.add_paragraph()
+        elif element.name not in ['script', 'style']:
+            parse_html_to_docx(element, document)
+
 
 @app.post("/download-report")
 async def download_report(request: DownloadRequest, current_user: User = Depends(auth_dependency)):
     try:
         document = Document()
+        styles = document.styles
+        if 'List Bullet' not in styles:
+            styles.add_style('List Bullet', 1)
+        
         soup = BeautifulSoup(request.html_content, 'html.parser')
 
-        for element in soup.find_all(True):
-            if element.name == 'table':
-                rows_data = []
-                for row in element.find_all('tr'):
-                    cols = row.find_all(['td', 'th'])
-                    cols = [ele.text.strip() for ele in cols]
-                    rows_data.append(cols)
-                
-                if not rows_data: continue
-
-                # Create table in docx
-                table = document.add_table(rows=len(rows_data), cols=len(rows_data[0]))
-                table.style = 'Table Grid'
-                for i, row_data in enumerate(rows_data):
-                    for j, cell_data in enumerate(row_data):
-                        table.cell(i, j).text = cell_data
-                document.add_paragraph() # Add space after table
-            
-            elif element.name in ['h1', 'h2', 'h3', 'p', 'li'] and element.find('table') is None:
-                document.add_paragraph(element.get_text())
+        parse_html_to_docx(soup, document)
 
         file_stream = io.BytesIO()
         document.save(file_stream)
@@ -708,7 +623,30 @@ async def download_report(request: DownloadRequest, current_user: User = Depends
             headers={"Content-Disposition": "attachment; filename=report.docx"}
         )
     except Exception as e:
+        print(f"Error creating Word document: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to create Word document: {e}")
+
+@app.post("/feedback")
+async def handle_feedback(request: FeedbackRequest, current_user: User = Depends(auth_dependency)):
+    if not clients.mongo_client:
+        raise HTTPException(status_code=503, detail="Database service is not configured.")
+    try:
+        feedback_collection = clients.mongo_client[config.cosmos_database_name][config.cosmos_feedback_collection]
+        
+        feedback_doc = {
+            "timestamp": datetime.now(timezone.utc),
+            "user": current_user.username,
+            "question": request.question,
+            "answer": request.answer,
+            "feedback": request.feedback
+        }
+        
+        feedback_collection.insert_one(feedback_doc)
+        return {"status": "success", "message": "Feedback recorded."}
+    except Exception as e:
+        print(f"Error recording feedback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to record feedback: {e}")
+
 
 
 
