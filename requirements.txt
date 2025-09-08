@@ -28,5 +28,10 @@ PyPDF2
 beautifulsoup4
 python-jose[cryptography]
 passlib[bcrypt]
-opentelemetry
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+openinference-instrumentation-openai
+opencensus-ext-azure
+
 
